@@ -2,6 +2,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { execSync } from "node:child_process";
 import { countTokens } from "@anthropic-ai/tokenizer";
 import {
   Separator,
@@ -1059,4 +1060,143 @@ async function runWizard() {
   );
 }
 
-runWizard();
+async function runQuickWizard(repo: string) {
+  const repoUrl = repo.startsWith("http") ? repo : undefined;
+  const repoPath = repoUrl
+    ? path.join(process.cwd(), path.basename(repoUrl, ".git"))
+    : path.resolve(repo);
+
+  if (repoUrl && !fs.existsSync(repoPath)) {
+    execSync(`git clone ${repoUrl} ${repoPath}`, { stdio: "inherit" });
+  }
+
+  const readmePath = path.join(repoPath, "README.md");
+  if (!fs.existsSync(readmePath)) {
+    throw new Error(`README.md not found in ${repoPath}`);
+  }
+
+  const primarySource = fs.readFileSync(readmePath, "utf-8");
+
+  const smarterModel = await select({
+    message: "Pick a model for generation:",
+    choices: AI_MODELS_UI.map((model) => ({
+      name: model.name,
+      value: model.model
+    }))
+  });
+
+  const provider = AI_MODELS_INFO[smarterModel].provider;
+  const apiKey = await password({
+    message: `Enter your ${provider.toUpperCase()} API key:`,
+    mask: "*"
+  });
+
+  const baseOptions: AICallerOptions = {
+    model: smarterModel,
+    maxOutputTokens: 2048,
+    apiKey
+  };
+
+  const descriptionResp = await callLLM(
+    getDescriptionInferenceMessages(primarySource),
+    { ...baseOptions, saveName: "description" }
+  );
+  const description = descriptionResp.success ? descriptionResp.message : "";
+
+  const title = path.basename(repoPath);
+
+  const themesResp = await callLLM(getThemeInferenceMessages(primarySource), {
+    ...baseOptions,
+    saveName: "themes",
+    jsonType: "start_array"
+  });
+  const themes = themesResp.success ? themesResp.message.join(", ") : "";
+
+  const outlineMessages = getOutlineInferenceMessages(
+    title,
+    primarySource,
+    description,
+    themes,
+    "",
+    ""
+  );
+
+  const outlineResp = await callLLM(outlineMessages, {
+    ...baseOptions,
+    saveName: "outline",
+    jsonType: "start_object",
+    maxOutputTokens: AI_MODELS_INFO[smarterModel].outputTokenLimit - 1,
+    continueOnPartialJSON: true
+  });
+
+  if (!outlineResp.success) {
+    console.error("Could not generate outline");
+    return;
+  }
+
+  const outline: Outline = outlineResp.message;
+
+  function getPages(
+    overall: Outline,
+    sections: OutlineSection[]
+  ): ReadyToGeneratePage[] {
+    return sections.flatMap((section) => {
+      const base: ReadyToGeneratePage = {
+        section,
+        levels: section.permalink.split(/(?<!\\)\//g).slice(1),
+        messages: getPageGenerationInferenceMessages(
+          outlineMessages,
+          overall,
+          section,
+          false
+        )
+      };
+      if (section.subsections) {
+        return [base, ...getPages(overall, section.subsections)];
+      }
+      return [base];
+    });
+  }
+
+  const pageMessages = getPages(outline, outline.sections);
+
+  const runner =
+    RUNNERS.find((r) => isCommandAvailable(r.command)) || RUNNERS[0];
+
+  const wizardState: WizardState = {
+    title,
+    description,
+    coreThemes: themes,
+    smarterModel,
+    smarterApikey: apiKey,
+    pageGenerationModel: smarterModel,
+    pageGenerationApikey: apiKey,
+    preferredRunnerForNextra: runner.command,
+    streamToConsole: false,
+    addDiagrams: false,
+    overwritePages: true,
+    faviconUrl:
+      "https://raw.githubusercontent.com/HebeHH/lumentis/choose-favicon/assets/default-favicon.png"
+  };
+
+  idempotentlySetupNextraDocs(process.cwd(), runner, wizardState);
+
+  await generatePages(
+    true,
+    pageMessages,
+    path.join(process.cwd(), "pages"),
+    wizardState,
+    1
+  );
+}
+
+const repoArg = process.argv.length > 2 ? process.argv[2] : undefined;
+
+if (repoArg) {
+  runQuickWizard(repoArg).catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+} else {
+  runWizard();
+}
